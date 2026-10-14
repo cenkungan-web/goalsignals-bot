@@ -2,11 +2,14 @@ import asyncio
 import io
 import logging
 import threading
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from zoneinfo import ZoneInfo
 
 from telegram import LinkPreviewOptions, Update, User
 from telegram.constants import ParseMode
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -55,7 +58,6 @@ def is_authorized(user: User) -> bool:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_authorized(user):
-        # Yetkisiz kişilere cevap bile vermez
         return
 
     text = (
@@ -64,14 +66,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Kullanıcı ID'niz: <code>{user.id}</code>\n\n"
         f"<b>Nasıl Kullanılır?</b>\n"
         f"1. Maç görselini seçin.\n"
-        f"2. Açıklama kısmına sadece tercihinizi yazın:\n"
+        f"2. Açıklama kısmına tercihinizi yazın:\n"
         f"   • <i>Oransız:</i> <code>10.5 ÜST KORNER</code>\n"
         f"   • <i>Oranlı:</i> <code>10.5 ÜST KORNER O 1.85</code>\n"
         f"3. Bot görseldeki takımları, skoru, dakikayı ve ligi okuyup 2 hedefe de iletir.\n\n"
         f"<b>Sonuçlandırma:</b>\n"
         f"Tahmin paylaşıldığında botun size atacağı mesaja yanıt (reply) verip:\n"
         f"• <code>W</code> ➡️ Kazandı alıntısı\n"
-        f"• <code>L</code> ➡️ Kaybetti alıntısı"
+        f"• <code>L</code> ➡️ Kaybetti alıntısı\n\n"
+        f"<b>Komutlar:</b>\n"
+        f"• <code>/rapor</code> : Günün durumunu önizler.\n"
+        f"• <code>/rapor yayinla</code> : Gün sonu raporunu kanallara hemen iletir.\n"
+        f"• <code>/targets</code> : Tanımlı hedef kanalları listeler.\n"
+        f"• <code>/id</code> : Bulunduğunuz yerin ID bilgilerini gösterir."
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -105,17 +112,64 @@ async def targets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"{idx}. <b>{name}</b>\n   • Chat ID: <code>{d['chat_id']}</code>\n   • Topic ID: <code>{d['thread_id']}</code>\n\n"
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
+async def rapor_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Adminin gün sonu raporunu elle görüntülemesini veya yayınlamasını sağlar."""
+    user = update.effective_user
+    if not is_authorized(user):
+        return
+
+    tz = ZoneInfo("Europe/Istanbul")
+    now = datetime.now(tz)
+    date_display = now.strftime("%d.%m.%Y")
+
+    report_data = database.get_daily_report_data(hours=24)
+    if not report_data or report_data["total"] == 0:
+        await update.message.reply_text(
+            f"ℹ️ Son 24 saat içinde kaydedilmiş herhangi bir tahmin bulunmuyor ({date_display})."
+        )
+        return
+
+    report_text = config.build_daily_report(report_data, date_display)
+
+    # Argüman kontrolü (/rapor yayinla)
+    args = context.args or []
+    if len(args) > 0 and args[0].lower() in ["yayinla", "gonder", "send"]:
+        destinations = config.get_target_destinations()
+        sent_count = 0
+        for target in destinations:
+            try:
+                await context.bot.send_message(
+                    chat_id=target["chat_id"],
+                    message_thread_id=target.get("thread_id"),
+                    text=report_text,
+                    parse_mode=ParseMode.HTML,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True)
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.error(f"Rapor gönderilemedi: {target['chat_id']} -> {e}")
+
+        await update.message.reply_text(
+            f"✅ Gün sonu raporu başarıyla {sent_count} topic'e yayınlandı!\n\n{report_text}",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        # Sadece önizleme göster
+        await update.message.reply_text(
+            f"👀 <b>GÜN SONU RAPOR ÖNİZLEMESİ:</b>\n\n{report_text}\n\n"
+            f"👉 <i>Bu raporu kanallara yayınlamak için:</i> <code>/rapor yayinla</code> yazabilirsiniz.",
+            parse_mode=ParseMode.HTML
+        )
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_authorized(user):
-        # Yetkisiz kullanıcılar tamamen engellenir
         return
 
     destinations = config.get_target_destinations()
     status_msg = await update.message.reply_text("⏳ Görsel analiz ediliyor ve maç bilgileri okunuyor...")
 
     try:
-        # Fotoğrafı indir
         photo = update.message.photo[-1]
         photo_file = await context.bot.get_file(photo.file_id)
         photo_bytes = await photo_file.download_as_bytearray()
@@ -123,7 +177,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Gemini Vision ile maç bilgilerini oku
         match_info = ocr.extract_match_info(bytes(photo_bytes), config.GEMINI_API_KEY)
 
-        # Kullanıcının yazdığı tercihi ayrıştır
+        # Tercih ve oranı ayrıştır
         raw_caption = update.message.caption or ""
         parsed_caption = config.parse_caption(raw_caption)
 
@@ -133,7 +187,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_items = []
         errors = []
 
-        # Her iki hedef topic'e de gönder
         for target in destinations:
             try:
                 sent_msg = await context.bot.send_photo(
@@ -155,11 +208,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.delete()
 
-        # Yöneticiye bilgi ver
+        match_title = f"{match_info['home_team']} - {match_info['away_team']}"
+
         confirm_text = (
             f"✅ <b>Tahmin Paylaşıldı!</b> ({len(sent_items)}/{len(destinations)} Topic)\n\n"
             f"<b>Okunan Maç:</b>\n"
-            f"⚽️ {match_info['home_team']} - {match_info['away_team']} ({match_info['score']})\n"
+            f"⚽️ {match_title} ({match_info['score']})\n"
             f"🏟 {match_info['league']}\n"
             f"⏰ {match_info['minute']}\n"
             f"🎯 Tercih: {parsed_caption['tercih']}\n"
@@ -179,8 +233,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         confirm_msg = await update.message.reply_text(confirm_text, parse_mode=ParseMode.HTML)
 
-        # Alıntılamalar için DB'ye kaydet
-        database.save_prediction(update.message.message_id, confirm_msg.message_id, sent_items)
+        # Veritabanına detaylı kaydet (Rapor ve alıntılama için)
+        database.save_prediction(
+            admin_msg_id=update.message.message_id,
+            confirm_msg_id=confirm_msg.message_id,
+            sent_items=sent_items,
+            match_title=match_title,
+            pick=parsed_caption["tercih"],
+            odds=parsed_caption.get("oran")
+        )
 
     except Exception as e:
         logger.error(f"Hata: {e}")
@@ -200,7 +261,8 @@ async def handle_result_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not reply:
         return
 
-    sent_items = database.get_sent_messages_by_reply(reply.message_id)
+    new_status = "WON" if text == "W" else "LOST"
+    prediction_id, sent_items = database.update_prediction_status(reply.message_id, new_status)
     if not sent_items:
         await update.message.reply_text("⚠️ Alıntıladığınız mesaja ait kayıtlı bir tahmin bulunamadı.")
         return
@@ -233,6 +295,58 @@ async def handle_result_reply(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode=ParseMode.HTML
     )
 
+# ----------------- GECE 01:00 GÜN SONU RAPORU ZAMANLAYICISI -----------------
+
+async def daily_report_scheduler(app: Application):
+    """
+    Her gece Türkiye saatiyle 01:00'da kontrol eder.
+    Eğer son 24 saatte tahmin paylaşılmışsa gün sonu raporunu otomatik kanallara gönderir.
+    Eğer hiç tahmin atılmamışsa hiçbir şey yapmaz.
+    """
+    tz = ZoneInfo("Europe/Istanbul")
+    last_reported_date = None
+
+    logger.info("Gün sonu rapor zamanlayıcısı devrede (Hedef: Her gece 01:00).")
+
+    while True:
+        try:
+            now = datetime.now(tz)
+            current_date_str = now.strftime("%Y-%m-%d")
+
+            # Gece 01:00 kontrolü
+            if now.hour == 1 and now.minute == 0 and last_reported_date != current_date_str:
+                yesterday = now - timedelta(days=1)
+                date_display = yesterday.strftime("%d.%m.%Y")
+
+                report_data = database.get_daily_report_data(hours=24)
+                if report_data and report_data["total"] > 0:
+                    report_text = config.build_daily_report(report_data, date_display)
+                    destinations = config.get_target_destinations()
+                    for target in destinations:
+                        try:
+                            await app.bot.send_message(
+                                chat_id=target["chat_id"],
+                                message_thread_id=target.get("thread_id"),
+                                text=report_text,
+                                parse_mode=ParseMode.HTML,
+                                link_preview_options=LinkPreviewOptions(is_disabled=True)
+                            )
+                        except Exception as e:
+                            logger.error(f"Otomatik rapor gönderilemedi: {target['chat_id']} -> {e}")
+
+                    logger.info(f"{date_display} tarihli gün sonu raporu kanallara iletildi.")
+                    last_reported_date = current_date_str
+
+        except Exception as e:
+            logger.error(f"Scheduler hatası: {e}")
+
+        # Her 30 saniyede bir saati kontrol et
+        await asyncio.sleep(30)
+
+async def post_init(application: Application):
+    """Bot ayağa kalktıktan sonra zamanlayıcıyı başlatır."""
+    asyncio.create_task(daily_report_scheduler(application))
+
 def main():
     if not config.BOT_TOKEN:
         print("HATA: BOT_TOKEN girilmemiş!")
@@ -241,11 +355,12 @@ def main():
     database.init_db()
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
+    app = ApplicationBuilder().token(config.BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("id", id_command))
     app.add_handler(CommandHandler("targets", targets_command))
+    app.add_handler(CommandHandler("rapor", rapor_command))
 
     # Özel mesajdan gelen fotoğraflar
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo))

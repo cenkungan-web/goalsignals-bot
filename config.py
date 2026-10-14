@@ -116,3 +116,42 @@ def build_prediction_caption(match_info: dict, parsed_caption: dict) -> str:
         return TEMPLATE_WITH_ODDS.format(**data)
     else:
         return TEMPLATE_WITHOUT_ODDS.format(**data)
+
+def build_daily_report(report_data: dict, date_str: str) -> str:
+    """Gün sonu rapor metnini formatlar."""
+    total = report_data["total"]
+    won = report_data["won"]
+    lost = report_data["lost"]
+    pending = report_data["pending"]
+    rate = report_data["success_rate"]
+
+    match_lines = []
+    for m in report_data["matches"]:
+        odds_str = f" @ {m['odds']}" if m.get("odds") else ""
+        match_lines.append(f"{m['icon']} {m['title']} ({m['pick']}{odds_str})")
+
+    matches_text = "\n".join(match_lines)
+
+    report = (
+        "📊 <b>GOALSIGNALS GÜN SONU RAPORU</b> 📊\n"
+        f"📅 <b>Tarih:</b> {date_str}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Toplam Tahmin:</b> {total}\n"
+        f"✅ <b>Kazanan:</b> {won}\n"
+        f"✖️ <b>Kaybeden:</b> {lost}\n"
+    )
+
+    if pending > 0:
+        report += f"⏳ <b>Sonuçlanmamış / Devam Eden:</b> {pending}\n"
+
+    report += (
+        f"📈 <b>Başarı Oranı:</b> %{rate}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<b>Günün Karşılaşmaları:</b>\n"
+        f"{matches_text}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🎁 <i>Tüm kazanan üyelerimizi tebrik eder, yarın için bol şanslar dileriz!</i>\n\n"
+        '🔗 <a href="https://goalsignals.com.tr">GoalSignals.Com.Tr</a>'
+    )
+    return report
+
